@@ -14,8 +14,9 @@ import soundfile as sf
 from PySide6.QtCore import QThread, Signal
 
 from backend.audio_capture import AudioCapture, resample, TARGET_SR
-from backend.errors import AudioCaptureError, STTEngineError
-from backend.stt_engine import STTEngine
+from backend.errors import AudioCaptureError, LLMConnectionError, STTEngineError
+from backend.medical_formatter import format_soap
+from backend.stt_engine import MedASREngine, STTEngine
 
 logger = logging.getLogger(__name__)
 
@@ -249,3 +250,79 @@ class FileTranscribeWorker(QThread):
 
         self.progress.emit(100)
         logger.info("FileTranscribeWorker finished")
+
+
+class MedASRModelLoadWorker(QThread):
+    """Loads the MedASR model on a background thread.
+
+    Signals:
+        finished: Emitted with the loaded MedASREngine on success.
+        error: Emitted with an error message string on failure.
+        progress: Emitted with status text during loading.
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, device: str = "auto", parent: Optional[object] = None) -> None:
+        super().__init__(parent)
+        self._device = device
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Loading MedASR model (first run may download from HuggingFace)..."
+            )
+            engine = MedASREngine(self._device)
+            engine.load_model()
+            self.finished.emit(engine)
+        except STTEngineError as exc:
+            logger.exception("MedASR model loading failed")
+            self.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Unexpected error loading MedASR model")
+            self.error.emit(f"Unexpected error: {exc}")
+
+
+class SoapFormatWorker(QThread):
+    """Sends transcript to a local LLM for SOAP formatting.
+
+    Signals:
+        soap_ready: Emitted with the parsed SOAP dict on success.
+        error: Emitted with an error message string on failure.
+    """
+
+    soap_ready = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        transcript: str,
+        endpoint: str,
+        model: str,
+        provider: str,
+        parent: Optional[object] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._transcript = transcript
+        self._endpoint = endpoint
+        self._model = model
+        self._provider = provider
+
+    def run(self) -> None:
+        try:
+            logger.info("SoapFormatWorker: calling LLM (%s)", self._provider)
+            result = format_soap(
+                self._transcript,
+                self._endpoint,
+                self._model,
+                self._provider,
+            )
+            self.soap_ready.emit(result)
+        except LLMConnectionError as exc:
+            logger.exception("SOAP formatting failed (LLM connection)")
+            self.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Unexpected error during SOAP formatting")
+            self.error.emit(f"SOAP formatting error: {exc}")

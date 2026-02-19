@@ -5,6 +5,7 @@ Main application window for STT Transcriber.
 import html
 import logging
 import queue
+import time
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -28,12 +29,22 @@ from PySide6.QtWidgets import (
 )
 
 from backend.config_manager import ConfigManager
+from backend.file_manager import (
+    default_filename,
+    export_csv,
+    export_md,
+    export_soap_txt,
+    export_txt,
+)
 from backend.paths import ensure_data_dirs
-from backend.stt_engine import STTEngine
+from backend.stt_engine import MedASREngine, STTEngine
+from gui.widgets.soap_view import SoapView
 from gui.workers import (
     AudioWorker,
     FileTranscribeWorker,
+    MedASRModelLoadWorker,
     ModelLoadWorker,
+    SoapFormatWorker,
     TranscribeWorker,
 )
 
@@ -65,6 +76,13 @@ class MainWindow(QMainWindow):
         self._pending_action: Optional[str] = None  # "record" or "import"
         self._pending_file_path: Optional[str] = None
 
+        # -- M3 state --
+        self._segments: list[dict] = []
+        self._recording_start_time: Optional[float] = None
+        self._medasr_engine: Optional[MedASREngine] = None
+        self._medasr_load_worker: Optional[MedASRModelLoadWorker] = None
+        self._soap_worker: Optional[SoapFormatWorker] = None
+
         self._build_menu_bar()
         self._build_central_widget()
         self._build_status_bar()
@@ -74,14 +92,20 @@ class MainWindow(QMainWindow):
         self.btn_pause.clicked.connect(self._on_pause_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
         self.btn_import_wav.clicked.connect(self._on_import_wav_clicked)
+        self.btn_export.clicked.connect(self._on_export_clicked)
+        self.export_action.triggered.connect(self._on_export_clicked)
+        self.btn_soapify.clicked.connect(self._on_soapify_clicked)
 
         # Enable Record and Import WAV buttons
         self.btn_record.setEnabled(True)
         self.btn_import_wav.setEnabled(True)
 
-        # Keyboard shortcut: Space toggles Record/Stop
+        # Keyboard shortcuts
         self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self._space_shortcut.activated.connect(self._on_space_pressed)
+
+        self._mode_shortcut = QShortcut(QKeySequence("Ctrl+M"), self)
+        self._mode_shortcut.activated.connect(self._on_toggle_mode)
 
         # Apply saved mode on startup
         self.apply_mode(self.config.mode)
@@ -193,6 +217,11 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.transcript_view)
 
+        # -- SOAP view (hidden by default, shown in medical mode) --
+        self.soap_view = SoapView()
+        self.soap_view.setVisible(False)
+        layout.addWidget(self.soap_view)
+
         # -- Bottom bar --
         bottom_bar = QHBoxLayout()
 
@@ -229,6 +258,16 @@ class MainWindow(QMainWindow):
         self.btn_medical.setChecked(is_medical)
         self.btn_soapify.setVisible(is_medical)
 
+        # Enable SOAPify only if medical mode and we have segments
+        if is_medical:
+            self.btn_soapify.setEnabled(bool(self._segments))
+        else:
+            # Switching away from medical — hide SOAP view, unload MedASR
+            self.soap_view.setVisible(False)
+            if self._medasr_engine is not None:
+                self._medasr_engine.unload_model()
+                self._medasr_engine = None
+
         mode_text = "Medical" if is_medical else "General"
         self.mode_status.setText(f"Mode: {mode_text}")
         self.statusBar().showMessage(f"Switched to {mode_text} mode", 3000)
@@ -239,6 +278,13 @@ class MainWindow(QMainWindow):
     def _on_mode_toggled(self, button_id: int) -> None:
         self.apply_mode("medical" if button_id == 1 else "general")
 
+    def _on_toggle_mode(self) -> None:
+        """Ctrl+M: toggle between general and medical mode."""
+        if self._is_recording:
+            return  # Don't switch while recording
+        new_mode = "general" if self.config.mode == "medical" else "medical"
+        self.apply_mode(new_mode)
+
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
@@ -246,11 +292,16 @@ class MainWindow(QMainWindow):
     def _ensure_model_loaded(self, then_action: str, **kwargs: object) -> bool:
         """Start model loading if needed. Returns True if already loaded.
 
+        Routes to MedASR or Whisper depending on the current mode.
+
         Args:
             then_action: ``"record"`` or ``"import"`` — action to take
                 after the model finishes loading.
             **kwargs: Extra state to save (e.g. file_path for import).
         """
+        if self.config.mode == "medical":
+            return self._ensure_medasr_loaded(then_action, **kwargs)
+
         if self._stt_engine is not None and self._stt_engine.is_loaded:
             return True
 
@@ -273,6 +324,34 @@ class MainWindow(QMainWindow):
         self._model_load_worker.start()
         return False
 
+    def _ensure_medasr_loaded(self, then_action: str, **kwargs: object) -> bool:
+        """Start MedASR model loading if needed. Returns True if already loaded."""
+        if self._medasr_engine is not None and self._medasr_engine.is_loaded:
+            return True
+
+        if self._medasr_load_worker is not None:
+            return False  # Already loading
+
+        self._pending_action = then_action
+        self._pending_file_path = kwargs.get("file_path")  # type: ignore[assignment]
+        self._set_controls_busy(True)
+
+        self._medasr_load_worker = MedASRModelLoadWorker(
+            device=self.config.medasr_device,
+            parent=self,
+        )
+        self._medasr_load_worker.progress.connect(self._on_model_progress)
+        self._medasr_load_worker.finished.connect(self._on_medasr_loaded)
+        self._medasr_load_worker.error.connect(self._on_medasr_error)
+        self._medasr_load_worker.finished.connect(
+            self._medasr_load_worker.deleteLater
+        )
+        self._medasr_load_worker.error.connect(
+            self._medasr_load_worker.deleteLater
+        )
+        self._medasr_load_worker.start()
+        return False
+
     def _on_model_progress(self, text: str) -> None:
         self.status_label.setText(text)
 
@@ -283,16 +362,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Ready")
         logger.info("STT engine loaded and ready")
 
-        # Execute the pending action
-        action = self._pending_action
-        self._pending_action = None
-        if action == "record":
-            self._start_recording()
-        elif action == "import":
-            file_path = self._pending_file_path
-            self._pending_file_path = None
-            if file_path:
-                self._start_file_transcription(file_path)
+        self._execute_pending_action()
 
     def _on_model_error(self, message: str) -> None:
         self._model_load_worker = None
@@ -305,6 +375,46 @@ class MainWindow(QMainWindow):
             "Model Load Error",
             f"Failed to load STT model:\n\n{message}",
         )
+
+    def _on_medasr_loaded(self, engine: object) -> None:
+        self._medasr_engine = engine  # type: ignore[assignment]
+        self._medasr_load_worker = None
+        self._set_controls_busy(False)
+        self.status_label.setText("Ready")
+        logger.info("MedASR engine loaded and ready")
+
+        self._execute_pending_action()
+
+    def _on_medasr_error(self, message: str) -> None:
+        self._medasr_load_worker = None
+        self._pending_action = None
+        self._pending_file_path = None
+        self._set_controls_busy(False)
+        self.status_label.setText("Ready")
+
+        hint = ""
+        if "401" in message or "access" in message.lower():
+            hint = (
+                "\n\nYou may need to accept the model terms at:\n"
+                "https://huggingface.co/google/medasr"
+            )
+        QMessageBox.critical(
+            self,
+            "MedASR Load Error",
+            f"Failed to load MedASR model:\n\n{message}{hint}",
+        )
+
+    def _execute_pending_action(self) -> None:
+        """Execute the deferred action after a model finishes loading."""
+        action = self._pending_action
+        self._pending_action = None
+        if action == "record":
+            self._start_recording()
+        elif action == "import":
+            file_path = self._pending_file_path
+            self._pending_file_path = None
+            if file_path:
+                self._start_file_transcription(file_path)
 
     # ------------------------------------------------------------------
     # Recording
@@ -321,6 +431,17 @@ class MainWindow(QMainWindow):
         source = self.config.audio_source
         device_index = self.config.audio_device_index
 
+        # Pick the correct engine based on mode
+        if self.config.mode == "medical":
+            engine = self._medasr_engine
+        else:
+            engine = self._stt_engine
+
+        if engine is None or not engine.is_loaded:
+            logger.error("Cannot start recording — engine not loaded")
+            return
+
+        self._recording_start_time = time.monotonic()
         self._chunk_queue = queue.Queue()
 
         self._audio_worker = AudioWorker(
@@ -334,7 +455,7 @@ class MainWindow(QMainWindow):
         self._audio_worker.finished.connect(self._on_audio_worker_finished)
 
         self._transcribe_worker = TranscribeWorker(
-            engine=self._stt_engine,
+            engine=engine,
             chunk_queue=self._chunk_queue,
             parent=self,
         )
@@ -365,18 +486,36 @@ class MainWindow(QMainWindow):
         self._cleanup_recording_workers()
 
     def _on_text_ready(self, text: str) -> None:
-        """Append transcribed text to the transcript view."""
+        """Append transcribed text to the transcript view and segment list."""
+        # Compute timestamp
+        if self._recording_start_time is not None:
+            elapsed = time.monotonic() - self._recording_start_time
+        else:
+            elapsed = 0.0
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+        # Store structured segment
+        self._segments.append({"timestamp": timestamp, "text": text})
+
+        # Display in transcript view
         safe_text = html.escape(text)
-        self.transcript_view.append(safe_text)
+        safe_ts = html.escape(timestamp)
+        self.transcript_view.append(f"[{safe_ts}] {safe_text}")
 
         # Auto-scroll to bottom
         scrollbar = self.transcript_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
         # Enable export if we have content
-        has_text = bool(self.transcript_view.toPlainText().strip())
+        has_text = bool(self._segments)
         self.btn_export.setEnabled(has_text)
         self.export_action.setEnabled(has_text)
+
+        # Enable SOAPify in medical mode if we have segments
+        if self.config.mode == "medical":
+            self.btn_soapify.setEnabled(has_text)
 
     def _on_transcribe_error(self, message: str) -> None:
         self.statusBar().showMessage(f"Transcription warning: {message}", 5000)
@@ -461,9 +600,17 @@ class MainWindow(QMainWindow):
     def _start_file_transcription(self, file_path: str) -> None:
         self._set_controls_busy(True)
         self.status_label.setText("Transcribing file...")
+        self._recording_start_time = time.monotonic()
+
+        # Pick the correct engine based on mode
+        engine = (
+            self._medasr_engine
+            if self.config.mode == "medical"
+            else self._stt_engine
+        )
 
         self._file_transcribe_worker = FileTranscribeWorker(
-            engine=self._stt_engine,
+            engine=engine,
             file_path=file_path,
             parent=self,
         )
@@ -527,6 +674,102 @@ class MainWindow(QMainWindow):
             self._on_stop_clicked()
         else:
             self._on_record_clicked()
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def _on_export_clicked(self) -> None:
+        """Export transcript or SOAP notes to a file."""
+        # Build filter string — include SOAP option if soap_view has content
+        filters = "Text Files (*.txt);;CSV Files (*.csv);;Markdown Files (*.md)"
+        if self.soap_view.isVisible():
+            filters = "SOAP Text (*.txt);;" + filters
+
+        initial_dir = self.config.export_directory or ""
+        suggested = default_filename("Transcript", "txt")
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Transcript",
+            f"{initial_dir}/{suggested}" if initial_dir else suggested,
+            filters,
+        )
+        if not file_path:
+            return
+
+        try:
+            if selected_filter == "SOAP Text (*.txt)":
+                soap_dict = self.soap_view.get_soap_dict()
+                export_soap_txt(soap_dict, file_path)
+            elif file_path.endswith(".csv"):
+                export_csv(self._segments, file_path)
+            elif file_path.endswith(".md"):
+                export_md(self._segments, file_path)
+            else:
+                export_txt(self._segments, file_path)
+
+            self.statusBar().showMessage(f"Exported to {file_path}", 5000)
+            logger.info("Exported to %s", file_path)
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Failed to export file:\n\n{exc}",
+            )
+
+    # ------------------------------------------------------------------
+    # SOAP formatting
+    # ------------------------------------------------------------------
+
+    def _on_soapify_clicked(self) -> None:
+        """Send the current transcript to the LLM for SOAP formatting."""
+        if self._soap_worker is not None:
+            return  # Already running
+
+        if not self._segments:
+            return
+
+        transcript = "\n".join(seg["text"] for seg in self._segments)
+        self.status_label.setText("Formatting SOAP notes...")
+        self.btn_soapify.setEnabled(False)
+
+        self._soap_worker = SoapFormatWorker(
+            transcript=transcript,
+            endpoint=self.config.llm_endpoint,
+            model=self.config.llm_model,
+            provider=self.config.llm_provider,
+            parent=self,
+        )
+        self._soap_worker.soap_ready.connect(self._on_soap_ready)
+        self._soap_worker.error.connect(self._on_soap_error)
+        self._soap_worker.finished.connect(self._on_soap_worker_finished)
+        self._soap_worker.start()
+
+    def _on_soap_ready(self, soap: dict) -> None:
+        """Handle successful SOAP formatting."""
+        self.soap_view.set_soap(soap)
+        self.soap_view.setVisible(True)
+        self.status_label.setText("SOAP notes ready")
+        self.statusBar().showMessage("SOAP formatting complete", 3000)
+        logger.info("SOAP notes generated successfully")
+
+    def _on_soap_error(self, message: str) -> None:
+        """Handle SOAP formatting failure."""
+        self.status_label.setText("Ready")
+        QMessageBox.critical(
+            self,
+            "SOAP Formatting Error",
+            f"Failed to format SOAP notes:\n\n{message}\n\n"
+            "Make sure your LLM server (Ollama or LM Studio) is running "
+            "and the endpoint is configured correctly in Settings.",
+        )
+
+    def _on_soap_worker_finished(self) -> None:
+        if self._soap_worker is not None:
+            self._soap_worker.deleteLater()
+            self._soap_worker = None
+        self.btn_soapify.setEnabled(bool(self._segments))
 
     # ------------------------------------------------------------------
     # Existing callbacks
