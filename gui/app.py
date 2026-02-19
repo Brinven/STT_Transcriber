@@ -38,6 +38,7 @@ from backend.file_manager import (
 )
 from backend.paths import ensure_data_dirs
 from backend.stt_engine import MedASREngine, STTEngine
+from gui.widgets.audio_player import AudioPlayerWidget
 from gui.widgets.soap_view import SoapView
 from gui.workers import (
     AudioWorker,
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self._on_export_clicked)
         self.export_action.triggered.connect(self._on_export_clicked)
         self.btn_soapify.clicked.connect(self._on_soapify_clicked)
+        self.btn_clear.clicked.connect(self._on_clear_all_clicked)
 
         # Enable Record and Import WAV buttons
         self.btn_record.setEnabled(True)
@@ -195,7 +197,7 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setEnabled(False)
 
-        self.btn_import_wav = QPushButton("Import WAV")
+        self.btn_import_wav = QPushButton("Import Audio")
         self.btn_import_wav.setEnabled(False)
 
         audio_bar.addWidget(self.source_combo)
@@ -217,6 +219,10 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.transcript_view)
 
+        # -- Audio player (hidden by default, shown after file import) --
+        self.audio_player = AudioPlayerWidget()
+        layout.addWidget(self.audio_player)
+
         # -- SOAP view (hidden by default, shown in medical mode) --
         self.soap_view = SoapView()
         self.soap_view.setVisible(False)
@@ -229,11 +235,15 @@ class MainWindow(QMainWindow):
         self.btn_soapify.setEnabled(False)
         self.btn_soapify.setVisible(False)
 
+        self.btn_clear = QPushButton("Clear All")
+        self.btn_clear.setEnabled(False)
+
         self.btn_export = QPushButton("Export")
         self.btn_export.setEnabled(False)
 
         bottom_bar.addWidget(self.btn_soapify)
         bottom_bar.addStretch()
+        bottom_bar.addWidget(self.btn_clear)
         bottom_bar.addWidget(self.btn_export)
 
         layout.addLayout(bottom_bar)
@@ -428,6 +438,7 @@ class MainWindow(QMainWindow):
         self._start_recording()
 
     def _start_recording(self) -> None:
+        self.audio_player.stop_playback()
         source = self.config.audio_source
         device_index = self.config.audio_device_index
 
@@ -499,18 +510,19 @@ class MainWindow(QMainWindow):
         # Store structured segment
         self._segments.append({"timestamp": timestamp, "text": text})
 
-        # Display in transcript view
-        safe_text = html.escape(text)
-        safe_ts = html.escape(timestamp)
+        # Display in transcript view (quote=False: avoid &#x27; Qt rendering bug)
+        safe_text = html.escape(text, quote=False)
+        safe_ts = html.escape(timestamp, quote=False)
         self.transcript_view.append(f"[{safe_ts}] {safe_text}")
 
         # Auto-scroll to bottom
         scrollbar = self.transcript_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-        # Enable export if we have content
+        # Enable export/clear if we have content
         has_text = bool(self._segments)
         self.btn_export.setEnabled(has_text)
+        self.btn_clear.setEnabled(has_text)
         self.export_action.setEnabled(has_text)
 
         # Enable SOAPify in medical mode if we have segments
@@ -586,9 +598,9 @@ class MainWindow(QMainWindow):
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import WAV File",
+            "Import Audio File",
             "",
-            "WAV Files (*.wav);;All Files (*)",
+            "Audio Files (*.wav *.mp3);;WAV Files (*.wav);;MP3 Files (*.mp3);;All Files (*)",
         )
         if not file_path:
             return
@@ -598,6 +610,7 @@ class MainWindow(QMainWindow):
         self._start_file_transcription(file_path)
 
     def _start_file_transcription(self, file_path: str) -> None:
+        self.audio_player.load_file(file_path)
         self._set_controls_busy(True)
         self.status_label.setText("Transcribing file...")
         self._recording_start_time = time.monotonic()
@@ -717,6 +730,24 @@ class MainWindow(QMainWindow):
                 "Export Error",
                 f"Failed to export file:\n\n{exc}",
             )
+
+    # ------------------------------------------------------------------
+    # Clear all
+    # ------------------------------------------------------------------
+
+    def _on_clear_all_clicked(self) -> None:
+        """Clear transcript, segments, and SOAP view."""
+        self._segments.clear()
+        self._recording_start_time = None
+        self.transcript_view.clear()
+        self.audio_player.clear()
+        self.soap_view.clear()
+        self.soap_view.setVisible(False)
+        self.btn_export.setEnabled(False)
+        self.btn_clear.setEnabled(False)
+        self.btn_soapify.setEnabled(False)
+        self.export_action.setEnabled(False)
+        self.statusBar().showMessage("Cleared", 2000)
 
     # ------------------------------------------------------------------
     # SOAP formatting

@@ -179,7 +179,7 @@ class TranscribeWorker(QThread):
 
 
 class FileTranscribeWorker(QThread):
-    """Reads a WAV file and transcribes it in segments.
+    """Reads an audio file (WAV, MP3, FLAC, OGG) and transcribes it in segments.
 
     Signals:
         text_ready: Emitted with transcribed text for each segment.
@@ -208,8 +208,11 @@ class FileTranscribeWorker(QThread):
         try:
             audio, sr = sf.read(self._file_path, dtype="float32")
         except Exception as exc:
-            logger.exception("Failed to read WAV file")
-            self.error.emit(f"Cannot read file: {exc}")
+            logger.exception("Failed to read audio file")
+            self.error.emit(
+                f"Cannot read file: {exc}\n"
+                "Supported formats: WAV, MP3, FLAC, OGG"
+            )
             return
 
         # Convert to mono
