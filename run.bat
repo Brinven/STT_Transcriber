@@ -39,6 +39,14 @@ if errorlevel 1 (
 )
 
 echo ============================================
+echo  Patching speechbrain for torchaudio 2.9...
+echo ============================================
+"%PIP%" install --force-reinstall --no-deps "git+https://github.com/speechbrain/speechbrain.git@develop"
+if errorlevel 1 (
+    echo WARNING: speechbrain patch failed. Speaker ID may not work.
+)
+
+echo ============================================
 echo  Setup complete!
 echo ============================================
 

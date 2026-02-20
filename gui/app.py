@@ -15,10 +15,13 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -876,21 +879,12 @@ class MainWindow(QMainWindow):
         """Kick off speaker diarization: load models if needed, then run."""
         # Ensure HF token is available (required for pyannote gated models).
         if not self.config.hf_token:
-            token, ok = QInputDialog.getText(
-                self,
-                "HuggingFace Token Required",
-                "Speaker identification requires a HuggingFace access token.\n\n"
-                "1. Create a token at: https://huggingface.co/settings/tokens\n"
-                "2. Accept terms at:\n"
-                "   - huggingface.co/pyannote/speaker-diarization-3.1\n"
-                "   - huggingface.co/pyannote/segmentation-3.0\n\n"
-                "Enter your token:",
-            )
-            if not ok or not token.strip():
+            token = self._prompt_hf_token()
+            if not token:
                 self.btn_diarize.setEnabled(True)
                 self.status_label.setText("Ready")
                 return
-            self.config.hf_token = token.strip()
+            self.config.hf_token = token
 
         self.status_label.setText("Preparing speaker identification...")
 
@@ -931,10 +925,31 @@ class MainWindow(QMainWindow):
         self._set_controls_busy(False)
         self.status_label.setText("Ready")
         self.statusBar().showMessage("File transcription complete", 3000)
+
+        # Give specific advice for common errors.
+        hint = ""
+        msg_lower = message.lower()
+        if "403" in message or "forbidden" in msg_lower or "gated" in msg_lower:
+            hint = (
+                "\n\nThis usually means:\n"
+                "- You haven't accepted the model terms yet (visit the\n"
+                "  links in Settings > HuggingFace Token), OR\n"
+                "- Your token is a fine-grained token without the\n"
+                '  "Access to public gated repos" permission.\n\n'
+                "Try using a classic Read token instead."
+            )
+            # Clear the bad token so the user gets re-prompted.
+            self.config.hf_token = ""
+            self._diarize_engine = None
+        elif "401" in message or "unauthorized" in msg_lower:
+            hint = "\n\nYour token appears to be invalid. Please check it."
+            self.config.hf_token = ""
+            self._diarize_engine = None
+
         QMessageBox.warning(
             self,
             "Speaker Identification Unavailable",
-            f"Could not load speaker diarization models:\n\n{message}\n\n"
+            f"Could not load speaker diarization models:\n\n{message}{hint}\n\n"
             "The transcript is still available without speaker labels.",
         )
         logger.warning("Diarization model load failed: %s", message)
@@ -1123,21 +1138,61 @@ class MainWindow(QMainWindow):
 
     def _on_hf_token_settings(self) -> None:
         """Open a dialog to set the HuggingFace access token."""
-        current = self.config.hf_token
-        token, ok = QInputDialog.getText(
-            self,
-            "HuggingFace Token",
-            "Enter your HuggingFace access token.\n"
-            "Required for speaker identification (pyannote).\n\n"
-            "Get a token at: https://huggingface.co/settings/tokens\n"
-            "You must also accept model terms at:\n"
-            "  - huggingface.co/pyannote/speaker-diarization-3.1\n"
-            "  - huggingface.co/pyannote/segmentation-3.0",
-            text=current,
+        token = self._prompt_hf_token(self.config.hf_token)
+        if token is not None:
+            self.config.hf_token = token
+            if token:
+                self.statusBar().showMessage("HuggingFace token saved", 3000)
+            else:
+                self.statusBar().showMessage("HuggingFace token cleared", 3000)
+
+    def _prompt_hf_token(self, current: str = "") -> str | None:
+        """Show a dialog with clickable links to get/set the HF token.
+
+        Returns the token string if accepted, or None if cancelled.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("HuggingFace Token")
+        dlg.setMinimumWidth(480)
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "<p>Speaker identification uses "
+            "<b>pyannote.audio</b>, which requires a free "
+            "HuggingFace account and access token.</p>"
+            "<p><b>Step 1:</b> Create or log in to your account and "
+            'generate a <b>token</b> at:<br>'
+            '<a href="https://huggingface.co/settings/tokens">'
+            "https://huggingface.co/settings/tokens</a><br>"
+            '<i>Recommended:</i> Use a <b>"Read"</b> token (classic). '
+            "If using a fine-grained token, enable "
+            '<b>"Access to public gated repos"</b>.</p>'
+            "<p><b>Step 2:</b> Accept the model license terms "
+            "(click each link, then click <b>Agree</b>):<br>"
+            '&bull; <a href="https://huggingface.co/pyannote/speaker-diarization-3.1">'
+            "pyannote/speaker-diarization-3.1</a><br>"
+            '&bull; <a href="https://huggingface.co/pyannote/segmentation-3.0">'
+            "pyannote/segmentation-3.0</a></p>"
+            "<p><b>Step 3:</b> Paste your token below:</p>"
         )
-        if ok and token.strip():
-            self.config.hf_token = token.strip()
-            self.statusBar().showMessage("HuggingFace token saved", 3000)
-        elif ok and not token.strip():
-            self.config.hf_token = ""
-            self.statusBar().showMessage("HuggingFace token cleared", 3000)
+        info.setWordWrap(True)
+        info.setOpenExternalLinks(True)
+        info.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(info)
+
+        token_input = QLineEdit()
+        token_input.setPlaceholderText("hf_xxxxxxxxxxxxxxxxxxxx")
+        token_input.setText(current)
+        layout.addWidget(token_input)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return token_input.text().strip()
+        return None

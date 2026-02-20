@@ -87,7 +87,7 @@ class DiarizationEngine:
             logger.info("Loading pyannote pipeline: %s", _PIPELINE_MODEL)
             pipeline = Pipeline.from_pretrained(
                 _PIPELINE_MODEL,
-                use_auth_token=self._hf_token,
+                token=self._hf_token,
             )
 
             # Use GPU if available.
@@ -156,18 +156,23 @@ class DiarizationEngine:
         )
 
         try:
-            diarization = self._pipeline(audio_input, **kwargs)
+            result = self._pipeline(audio_input, **kwargs)
         except Exception as exc:
             raise DiarizationError(
                 f"Diarization pipeline failed: {exc}"
             ) from exc
+
+        # pyannote 4.x returns DiarizeOutput; the Annotation is on
+        # .speaker_diarization (or .exclusive_speaker_diarization for
+        # non-overlapping turns).
+        annotation = getattr(result, "speaker_diarization", result)
 
         # Convert pyannote Annotation to SpeakerSegment list.
         # Speaker labels are like "SPEAKER_00", "SPEAKER_01", etc.
         speaker_label_to_id: dict[str, int] = {}
         segments: list[SpeakerSegment] = []
 
-        for turn, _, speaker_label in diarization.itertracks(yield_label=True):
+        for turn, _, speaker_label in annotation.itertracks(yield_label=True):
             if speaker_label not in speaker_label_to_id:
                 speaker_label_to_id[speaker_label] = len(speaker_label_to_id)
 
