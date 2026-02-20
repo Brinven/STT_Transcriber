@@ -12,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QUrl, Qt
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -62,6 +63,11 @@ class AudioPlayerWidget(QWidget):
         self.volume_slider.setValue(50)
         self.volume_slider.setFixedWidth(80)
 
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["1x", "1.5x", "2x", "3x", "4x"])
+        self.speed_combo.setFixedWidth(55)
+        self.speed_combo.setToolTip("Playback speed")
+
         self.lbl_filename = QLabel("")
         self.lbl_filename.setStyleSheet("color: gray; font-style: italic;")
 
@@ -72,6 +78,7 @@ class AudioPlayerWidget(QWidget):
         layout.addWidget(self.btn_stop)
         layout.addWidget(self.lbl_time)
         layout.addWidget(self.seek_slider, stretch=1)
+        layout.addWidget(self.speed_combo)
         layout.addWidget(QLabel("Vol:"))
         layout.addWidget(self.volume_slider)
         layout.addWidget(self.lbl_filename)
@@ -80,6 +87,7 @@ class AudioPlayerWidget(QWidget):
         self.btn_play_pause.clicked.connect(self._on_play_pause)
         self.btn_stop.clicked.connect(self._on_stop)
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
 
         # -- Signal wiring (seek slider anti-jitter) --
         self.seek_slider.sliderPressed.connect(self._on_slider_pressed)
@@ -121,6 +129,7 @@ class AudioPlayerWidget(QWidget):
         self.btn_play_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.lbl_time.setText("00:00 / 00:00")
+        self.speed_combo.setCurrentIndex(0)  # reset to 1x
         self.lbl_filename.setText("")
         self.setVisible(False)
 
@@ -140,6 +149,10 @@ class AudioPlayerWidget(QWidget):
 
     def _on_volume_changed(self, value: int) -> None:
         self._audio_output.setVolume(value / 100.0)
+
+    def _on_speed_changed(self, text: str) -> None:
+        rate = float(text.rstrip("x"))
+        self._player.setPlaybackRate(rate)
 
     # ------------------------------------------------------------------
     # Seek slider anti-jitter

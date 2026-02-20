@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+pretrained_models/
+data/
+*.egg-info/
+dist/
+build/
+.claude/
+=1.0.0
+*.spec
+Transcript_*.txt

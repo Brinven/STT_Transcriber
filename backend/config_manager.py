@@ -30,6 +30,9 @@ def _get_defaults() -> dict[str, Any]:
         "llm_provider": "ollama",
         "export_directory": "",
         "font_size": 12,
+        "diarization_enabled": False,
+        "last_import_dir": "",
+        "hf_token": "",
     }
 
 
@@ -163,3 +166,27 @@ class ConfigManager:
     @font_size.setter
     def font_size(self, value: int) -> None:
         self.set("font_size", value)
+
+    @property
+    def diarization_enabled(self) -> bool:
+        return self._config.get("diarization_enabled", False)
+
+    @diarization_enabled.setter
+    def diarization_enabled(self, value: bool) -> None:
+        self.set("diarization_enabled", value)
+
+    @property
+    def last_import_dir(self) -> str:
+        return self._config.get("last_import_dir", "")
+
+    @last_import_dir.setter
+    def last_import_dir(self, value: str) -> None:
+        self.set("last_import_dir", value)
+
+    @property
+    def hf_token(self) -> str:
+        return self._config.get("hf_token", "")
+
+    @hf_token.setter
+    def hf_token(self, value: str) -> None:
+        self.set("hf_token", value)

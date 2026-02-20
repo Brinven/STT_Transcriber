@@ -15,3 +15,7 @@ class AudioCaptureError(RuntimeError):
 
 class LLMConnectionError(RuntimeError):
     """Raised when the local LLM server (Ollama/LM Studio) is unreachable or returns an error."""
+
+
+class DiarizationError(RuntimeError):
+    """Raised when speaker diarization fails during loading or inference."""

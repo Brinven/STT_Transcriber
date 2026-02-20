@@ -14,7 +14,7 @@ import soundfile as sf
 from PySide6.QtCore import QThread, Signal
 
 from backend.audio_capture import AudioCapture, resample, TARGET_SR
-from backend.errors import AudioCaptureError, LLMConnectionError, STTEngineError
+from backend.errors import AudioCaptureError, DiarizationError, LLMConnectionError, STTEngineError
 from backend.medical_formatter import format_soap
 from backend.stt_engine import MedASREngine, STTEngine
 
@@ -286,6 +286,98 @@ class MedASRModelLoadWorker(QThread):
         except Exception as exc:
             logger.exception("Unexpected error loading MedASR model")
             self.error.emit(f"Unexpected error: {exc}")
+
+
+class DiarizeModelLoadWorker(QThread):
+    """Loads pyannote diarization pipeline on a background thread.
+
+    Signals:
+        finished: Emitted with the loaded DiarizationEngine on success.
+        error: Emitted with an error message string on failure.
+        progress: Emitted with status text during loading.
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, hf_token: str = "", parent: Optional[object] = None) -> None:
+        super().__init__(parent)
+        self._hf_token = hf_token
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Loading speaker diarization models (first run may download)..."
+            )
+            from backend.diarization import DiarizationEngine
+
+            engine = DiarizationEngine(hf_token=self._hf_token)
+            engine.load_models()
+            self.finished.emit(engine)
+        except DiarizationError as exc:
+            logger.exception("Diarization model loading failed")
+            self.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Unexpected error loading diarization models")
+            self.error.emit(f"Unexpected error: {exc}")
+
+
+class DiarizeWorker(QThread):
+    """Runs speaker diarization on an audio file.
+
+    Signals:
+        diarization_ready: Emitted with the list of SpeakerSegment on success.
+        progress: Emitted with status text during processing.
+        error: Emitted with an error message string on failure.
+    """
+
+    diarization_ready = Signal(list)
+    progress = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        engine: object,
+        file_path: str,
+        num_speakers: Optional[int] = None,
+        parent: Optional[object] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._file_path = file_path
+        self._num_speakers = num_speakers
+
+    def run(self) -> None:
+        logger.info("DiarizeWorker started: %s", self._file_path)
+        self.progress.emit("Identifying speakers...")
+        try:
+            audio, sr = sf.read(self._file_path, dtype="float32")
+        except Exception as exc:
+            logger.exception("Failed to read audio file for diarization")
+            self.error.emit(f"Cannot read file for diarization: {exc}")
+            return
+
+        # Convert to mono
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1).astype(np.float32)
+
+        # Resample to 16 kHz
+        if sr != TARGET_SR:
+            audio = resample(audio, sr, TARGET_SR)
+
+        try:
+            timeline = self._engine.diarize(  # type: ignore[union-attr]
+                audio,
+                num_speakers=self._num_speakers,
+            )
+            self.diarization_ready.emit(timeline)
+        except DiarizationError as exc:
+            logger.exception("Diarization failed")
+            self.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Unexpected diarization error")
+            self.error.emit(f"Diarization error: {exc}")
 
 
 class SoapFormatWorker(QThread):

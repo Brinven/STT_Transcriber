@@ -27,12 +27,28 @@ def default_filename(prefix: str, ext: str) -> str:
     return f"{prefix}_{ts}.{ext}"
 
 
-def export_txt(segments: list[dict], file_path: str) -> None:
+def _speaker_label(seg: dict, speaker_names: dict[int, str] | None) -> str:
+    """Return a speaker label string like ``"[Speaker 1] "`` or ``""``."""
+    if speaker_names is None:
+        return ""
+    spk = seg.get("speaker")
+    if spk is None:
+        return ""
+    name = speaker_names.get(spk, f"Speaker {spk + 1}")
+    return f"[{name}] "
+
+
+def export_txt(
+    segments: list[dict],
+    file_path: str,
+    speaker_names: dict[int, str] | None = None,
+) -> None:
     """Export transcript segments as timestamped plain text.
 
     Args:
         segments: List of ``{"timestamp": str, "text": str}`` dicts.
         file_path: Destination file path.
+        speaker_names: Optional map of speaker_id → display name.
 
     Raises:
         OSError: If the file cannot be written.
@@ -40,35 +56,57 @@ def export_txt(segments: list[dict], file_path: str) -> None:
     path = Path(file_path)
     with path.open("w", encoding="utf-8") as f:
         for seg in segments:
-            f.write(f"[{seg['timestamp']}] {seg['text']}\n")
+            label = _speaker_label(seg, speaker_names)
+            f.write(f"{label}[{seg['timestamp']}] {seg['text']}\n")
     logger.info("Exported TXT to %s", file_path)
 
 
-def export_csv(segments: list[dict], file_path: str) -> None:
-    """Export transcript segments as CSV with Timestamp and Text columns.
+def export_csv(
+    segments: list[dict],
+    file_path: str,
+    speaker_names: dict[int, str] | None = None,
+) -> None:
+    """Export transcript segments as CSV.
+
+    Includes a Speaker column when any segment has a speaker assigned.
 
     Args:
         segments: List of ``{"timestamp": str, "text": str}`` dicts.
         file_path: Destination file path.
+        speaker_names: Optional map of speaker_id → display name.
 
     Raises:
         OSError: If the file cannot be written.
     """
+    has_speakers = speaker_names is not None and any(
+        seg.get("speaker") is not None for seg in segments
+    )
     path = Path(file_path)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Text"])
+        header = ["Speaker", "Timestamp", "Text"] if has_speakers else ["Timestamp", "Text"]
+        writer.writerow(header)
         for seg in segments:
-            writer.writerow([seg["timestamp"], seg["text"]])
+            if has_speakers:
+                spk = seg.get("speaker")
+                name = speaker_names.get(spk, f"Speaker {spk + 1}") if spk is not None else ""  # type: ignore[union-attr]
+                writer.writerow([name, seg["timestamp"], seg["text"]])
+            else:
+                writer.writerow([seg["timestamp"], seg["text"]])
     logger.info("Exported CSV to %s", file_path)
 
 
-def export_md(segments: list[dict], file_path: str) -> None:
+def export_md(
+    segments: list[dict],
+    file_path: str,
+    speaker_names: dict[int, str] | None = None,
+) -> None:
     """Export transcript segments as Markdown.
 
     Args:
         segments: List of ``{"timestamp": str, "text": str}`` dicts.
         file_path: Destination file path.
+        speaker_names: Optional map of speaker_id → display name.
 
     Raises:
         OSError: If the file cannot be written.
@@ -77,7 +115,14 @@ def export_md(segments: list[dict], file_path: str) -> None:
     with path.open("w", encoding="utf-8") as f:
         f.write("## Transcript\n\n")
         for seg in segments:
-            f.write(f"- **[{seg['timestamp']}]** {seg['text']}\n")
+            label = _speaker_label(seg, speaker_names)
+            if label:
+                # Bold the speaker name portion
+                spk = seg.get("speaker")
+                name = speaker_names.get(spk, f"Speaker {spk + 1}") if spk is not None and speaker_names else ""  # type: ignore[union-attr]
+                f.write(f"- **[{name}]** **[{seg['timestamp']}]** {seg['text']}\n")
+            else:
+                f.write(f"- **[{seg['timestamp']}]** {seg['text']}\n")
     logger.info("Exported Markdown to %s", file_path)
 
 
