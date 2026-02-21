@@ -24,7 +24,7 @@
 ### Key Libraries (requirements.txt)
 - `PySide6` — Qt6 GUI framework
 - `faster-whisper` — General-mode offline STT via CTranslate2
-- `transformers` — HuggingFace transformers (required for MedASR, **>= 5.0.0**)
+- `transformers` — HuggingFace transformers (required for MedASR, **>= 5.0.0** — MedASR `lasr_ctc` model type requires 5.x; we monkey-patch a bug in `LasrFeatureExtractor`)
 - `torch` — PyTorch backend for MedASR inference
 - `sounddevice` — Audio capture (mic + WASAPI loopback)
 - `soundfile` — WAV file reading/writing

@@ -104,21 +104,29 @@ class STTEngine:
 class MedASREngine:
     """Medical speech-to-text using Google MedASR (Conformer CTC).
 
-    Uses the ``google/medasr`` model from HuggingFace via the
-    ``transformers`` automatic-speech-recognition pipeline.
+    Uses ``google/medasr`` (AutoModelForCTC + AutoProcessor) with manual
+    CTC greedy decoding.  The transformers ASR pipeline has a broken CTC
+    decoder for this model that produces stuttered/duplicated output, so
+    we drive inference directly.
 
     Args:
         device: ``"auto"`` (CUDA if available, else CPU), ``"cpu"``,
             or ``"cuda"``.
+        hf_token: HuggingFace token for gated model access.
     """
 
-    def __init__(self, device: str = "auto") -> None:
+    _MODEL_NAME = "google/medasr"
+
+    def __init__(self, device: str = "auto", hf_token: str = "") -> None:
         self._device_str = device
-        self._pipeline = None  # type: ignore[assignment]
+        self._hf_token = hf_token
+        self._model = None
+        self._processor = None
+        self._device = None  # resolved torch.device
 
     @property
     def is_loaded(self) -> bool:
-        return self._pipeline is not None
+        return self._model is not None
 
     def load_model(self) -> None:
         """Download (if needed) and load the MedASR model.
@@ -130,24 +138,36 @@ class MedASREngine:
         Raises:
             STTEngineError: If model loading fails.
         """
-        if self._pipeline is not None:
+        if self._model is not None:
             logger.info("MedASR model already loaded, skipping")
             return
 
-        device = self._resolve_device()
-        logger.info("Loading MedASR model on device: %s", device)
+        self._patch_lasr_feature_extractor()
+
+        device_str = self._resolve_device()
+        logger.info("Loading MedASR model on device: %s", device_str)
 
         try:
-            import torch  # noqa: F401
-            from transformers import pipeline
+            import torch
+            from transformers import AutoModelForCTC, AutoProcessor
 
-            self._pipeline = pipeline(
-                "automatic-speech-recognition",
-                model="google/medasr",
-                device=device,
+            kwargs: dict = {}
+            if self._hf_token:
+                kwargs["token"] = self._hf_token
+
+            self._processor = AutoProcessor.from_pretrained(
+                self._MODEL_NAME, **kwargs,
             )
+            self._model = AutoModelForCTC.from_pretrained(
+                self._MODEL_NAME, **kwargs,
+            )
+            self._device = torch.device(device_str)
+            self._model.to(self._device)
+            self._model.eval()
             logger.info("MedASR model loaded successfully")
         except Exception as exc:
+            self._model = None
+            self._processor = None
             raise STTEngineError(
                 f"Failed to load MedASR model: {exc}"
             ) from exc
@@ -164,28 +184,93 @@ class MedASREngine:
         Raises:
             STTEngineError: If the model is not loaded or transcription fails.
         """
-        if self._pipeline is None:
+        if self._model is None or self._processor is None:
             raise STTEngineError("MedASR model not loaded — call load_model() first")
 
         if len(audio) == 0:
             return ""
 
         try:
-            result = self._pipeline(
-                {"raw": audio, "sampling_rate": 16000},
-                chunk_length_s=20,
-                stride_length_s=2,
+            import torch
+
+            inputs = self._processor.feature_extractor(
+                audio,
+                sampling_rate=16000,
+                return_tensors="pt",
+                return_attention_mask=True,
             )
-            text = result.get("text", "").strip()
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                logits = self._model(**inputs).logits
+
+            # CTC greedy decode: argmax → collapse consecutive duplicates → remove blanks
+            pred_ids = torch.argmax(logits, dim=-1)[0].cpu().tolist()
+            text = self._ctc_decode(pred_ids)
             return text
         except Exception as exc:
             raise STTEngineError(f"MedASR transcription failed: {exc}") from exc
 
+    def _ctc_decode(self, token_ids: list[int]) -> str:
+        """Greedy CTC decoding: collapse consecutive duplicates, remove blanks."""
+        # Step 1: collapse consecutive identical tokens
+        collapsed: list[int] = []
+        prev = None
+        for idx in token_ids:
+            if idx != prev:
+                collapsed.append(idx)
+            prev = idx
+
+        # Step 2: remove blank token (epsilon = 0)
+        collapsed = [idx for idx in collapsed if idx != 0]
+
+        if not collapsed:
+            return ""
+
+        # Step 3: decode token IDs to text
+        text = self._processor.tokenizer.decode(  # type: ignore[union-attr]
+            collapsed, skip_special_tokens=True,
+        )
+        # Strip leading stray punctuation/brackets from first-frame artifacts
+        return text.strip().lstrip("]}).,:;!? ")
+
     def unload_model(self) -> None:
         """Release the model from memory."""
-        if self._pipeline is not None:
-            self._pipeline = None
+        if self._model is not None:
+            self._model = None
+            self._processor = None
+            self._device = None
             logger.info("MedASR model unloaded")
+
+    @staticmethod
+    def _patch_lasr_feature_extractor() -> None:
+        """Patch a bug in transformers' LasrFeatureExtractor.
+
+        The ``__call__`` method passes ``(waveform, device, center)`` to
+        ``_torch_extract_fbank_features`` but the method signature only
+        accepts ``(self, waveform, device)``.  We patch it to accept and
+        ignore the extra ``center`` kwarg so transcription works.
+        """
+        try:
+            from transformers.models.lasr.feature_extraction_lasr import (
+                LasrFeatureExtractor,
+            )
+        except ImportError:
+            return  # lasr not available in this transformers version
+
+        import inspect
+
+        sig = inspect.signature(LasrFeatureExtractor._torch_extract_fbank_features)
+        if "center" in sig.parameters:
+            return  # already patched or fixed upstream
+
+        original = LasrFeatureExtractor._torch_extract_fbank_features
+
+        def _patched(self, waveform, device="cpu", center=True):  # type: ignore[override]
+            return original(self, waveform, device)
+
+        LasrFeatureExtractor._torch_extract_fbank_features = _patched
+        logger.info("Patched LasrFeatureExtractor._torch_extract_fbank_features")
 
     def _resolve_device(self) -> str:
         """Resolve the device string to use for inference."""

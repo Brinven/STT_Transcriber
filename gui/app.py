@@ -168,6 +168,12 @@ class MainWindow(QMainWindow):
         hf_token_action = settings_menu.addAction("HuggingFace &Token...")
         hf_token_action.triggered.connect(self._on_hf_token_settings)
 
+        llm_settings_action = settings_menu.addAction("&LLM Server...")
+        llm_settings_action.triggered.connect(self._on_llm_settings)
+
+        soap_layout_action = settings_menu.addAction("SOAP &Layout...")
+        soap_layout_action.triggered.connect(self._on_soap_layout_settings)
+
     # ------------------------------------------------------------------
     # Central widget
     # ------------------------------------------------------------------
@@ -231,7 +237,7 @@ class MainWindow(QMainWindow):
             "If you know how many people are talking, setting\n"
             "this improves speaker identification accuracy."
         )
-        self.spn_num_speakers.setFixedWidth(80)
+        self.spn_num_speakers.setMinimumWidth(70)
 
         self.btn_diarize = QPushButton("Identify Speakers")
         self.btn_diarize.setEnabled(False)
@@ -246,6 +252,7 @@ class MainWindow(QMainWindow):
         audio_bar.addWidget(self.btn_pause)
         audio_bar.addWidget(self.btn_stop)
         audio_bar.addWidget(self.btn_import_wav)
+        audio_bar.addStretch()  # push speaker controls to the right
         audio_bar.addWidget(lbl_num_speakers)
         audio_bar.addWidget(self.spn_num_speakers)
         audio_bar.addWidget(self.btn_diarize)
@@ -274,7 +281,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.audio_player)
 
         # -- SOAP view (hidden by default, shown in medical mode) --
-        self.soap_view = SoapView()
+        self.soap_view = SoapView(layout_mode=self.config.soap_layout)
         self.soap_view.setVisible(False)
         layout.addWidget(self.soap_view)
 
@@ -398,6 +405,7 @@ class MainWindow(QMainWindow):
 
         self._medasr_load_worker = MedASRModelLoadWorker(
             device=self.config.medasr_device,
+            hf_token=self.config.hf_token,
             parent=self,
         )
         self._medasr_load_worker.progress.connect(self._on_model_progress)
@@ -1135,6 +1143,84 @@ class MainWindow(QMainWindow):
         self.config.font_size = size
         self.transcript_view.setStyleSheet(f"font-size: {size}pt;")
         logger.info("Font size set to %d", size)
+
+    def _on_llm_settings(self) -> None:
+        """Open a dialog to configure the LLM server for SOAP formatting."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("LLM Server Settings")
+        dlg.setMinimumWidth(450)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel(
+            "<b>LLM server for SOAP note formatting</b><br>"
+            "<i>Used when you click SOAPify in Medical mode.</i>"
+        ))
+
+        # Provider
+        prov_layout = QHBoxLayout()
+        prov_layout.addWidget(QLabel("Provider:"))
+        prov_combo = QComboBox()
+        prov_combo.addItems(["LM Studio", "Ollama"])
+        if self.config.llm_provider == "ollama":
+            prov_combo.setCurrentIndex(1)
+        prov_layout.addWidget(prov_combo)
+        layout.addLayout(prov_layout)
+
+        # Endpoint
+        ep_layout = QHBoxLayout()
+        ep_layout.addWidget(QLabel("Endpoint:"))
+        ep_input = QLineEdit()
+        ep_input.setText(self.config.llm_endpoint)
+        ep_layout.addWidget(ep_input)
+        layout.addLayout(ep_layout)
+
+        # Auto-fill endpoint when provider changes
+        def _on_provider_changed(idx: int) -> None:
+            current = ep_input.text()
+            if idx == 0 and "11434" in current:
+                ep_input.setText("http://localhost:1234/v1/chat/completions")
+            elif idx == 1 and "1234" in current:
+                ep_input.setText("http://localhost:11434/api/generate")
+        prov_combo.currentIndexChanged.connect(_on_provider_changed)
+
+        # Model
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Model:"))
+        model_input = QLineEdit()
+        model_input.setText(self.config.llm_model)
+        model_input.setPlaceholderText("e.g. medgemma-1.5-4b-it")
+        model_layout.addWidget(model_input)
+        layout.addLayout(model_layout)
+
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.config.llm_provider = "ollama" if prov_combo.currentIndex() == 1 else "lm_studio"
+            self.config.llm_endpoint = ep_input.text().strip()
+            self.config.llm_model = model_input.text().strip()
+            self.statusBar().showMessage("LLM settings saved", 3000)
+            logger.info(
+                "LLM settings: provider=%s, endpoint=%s, model=%s",
+                self.config.llm_provider,
+                self.config.llm_endpoint,
+                self.config.llm_model,
+            )
+
+    def _on_soap_layout_settings(self) -> None:
+        """Toggle SOAP layout between grid (2x2) and vertical."""
+        current = self.config.soap_layout
+        new_layout = "vertical" if current == "grid" else "grid"
+        self.config.soap_layout = new_layout
+        self.soap_view.set_layout_mode(new_layout)
+        label = "Grid (2\u00d72)" if new_layout == "grid" else "Vertical"
+        self.statusBar().showMessage(f"SOAP layout: {label}", 3000)
 
     def _on_hf_token_settings(self) -> None:
         """Open a dialog to set the HuggingFace access token."""

@@ -145,17 +145,25 @@ def _call_lm_studio(endpoint: str, model: str, prompt: str) -> str:
 def _parse_soap(text: str) -> dict:
     """Parse LLM output into SOAP sections.
 
-    Looks for section headers like "Subjective:", "Objective:", etc.
-    If headers are not found, the entire text is placed under "assessment"
-    as a fallback.
+    Looks for section headers like "Subjective:", "**Objective:**",
+    "## Assessment:", etc.  If headers are not found, the entire text
+    is placed under "assessment" as a fallback.
 
     Returns:
         Dict with keys: subjective, objective, assessment, plan.
     """
+    logger.debug("Raw LLM response for SOAP parsing:\n%s", text)
+
+    # Match headers like:  Subjective:  |  **Subjective:**  |  ## Subjective:
+    #                      ### **Subjective:**  |  SUBJECTIVE:  |  **Subjective**:
     pattern = re.compile(
-        r"(?:^|\n)\s*(?:#+\s*)?"  # optional markdown heading
-        r"(subjective|objective|assessment|plan)"
-        r"\s*:?\s*\n",
+        r"(?:^|\n)"           # start of string or newline
+        r"\s*(?:#+\s*)?"      # optional markdown heading (##, ###, etc.)
+        r"\*{0,2}"            # optional leading **
+        r"\s*(subjective|objective|assessment|plan)\s*"
+        r"\*{0,2}"            # optional trailing **
+        r"\s*:?\s*\*{0,2}"   # optional colon, optional trailing **
+        r"\s*",               # trailing whitespace (no mandatory newline)
         re.IGNORECASE,
     )
 
@@ -172,6 +180,7 @@ def _parse_soap(text: str) -> dict:
 
     # If we found at least one section, fill missing ones with ""
     if sections:
+        logger.info("Parsed SOAP sections: %s", list(sections.keys()))
         return {
             "subjective": sections.get("subjective", ""),
             "objective": sections.get("objective", ""),

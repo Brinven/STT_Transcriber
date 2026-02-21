@@ -268,16 +268,17 @@ class MedASRModelLoadWorker(QThread):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, device: str = "auto", parent: Optional[object] = None) -> None:
+    def __init__(self, device: str = "auto", hf_token: str = "", parent: Optional[object] = None) -> None:
         super().__init__(parent)
         self._device = device
+        self._hf_token = hf_token
 
     def run(self) -> None:
         try:
             self.progress.emit(
                 "Loading MedASR model (first run may download from HuggingFace)..."
             )
-            engine = MedASREngine(self._device)
+            engine = MedASREngine(self._device, hf_token=self._hf_token)
             engine.load_model()
             self.finished.emit(engine)
         except STTEngineError as exc:

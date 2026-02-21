@@ -39,12 +39,25 @@ if errorlevel 1 (
 )
 
 echo ============================================
+echo  Installing transformers from source...
+echo ============================================
+"%PIP%" install "git+https://github.com/huggingface/transformers.git"
+if errorlevel 1 (
+    echo WARNING: transformers source install failed. MedASR may not work.
+)
+
+echo ============================================
 echo  Patching speechbrain for torchaudio 2.9...
 echo ============================================
 "%PIP%" install --force-reinstall --no-deps "git+https://github.com/speechbrain/speechbrain.git@develop"
 if errorlevel 1 (
     echo WARNING: speechbrain patch failed. Speaker ID may not work.
 )
+
+echo ============================================
+echo  Removing torchcodec (broken on Windows)...
+echo ============================================
+"%PIP%" uninstall torchcodec -y >nul 2>&1
 
 echo ============================================
 echo  Setup complete!

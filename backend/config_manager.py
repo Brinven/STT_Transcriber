@@ -25,14 +25,15 @@ def _get_defaults() -> dict[str, Any]:
         "audio_device_index": None,
         "whisper_model_size": "base",
         "medasr_device": "auto",
-        "llm_endpoint": "http://localhost:11434/api/generate",
-        "llm_model": "medllama2",
-        "llm_provider": "ollama",
+        "llm_endpoint": "http://localhost:1234/v1/chat/completions",
+        "llm_model": "medgemma-1.5-4b-it",
+        "llm_provider": "lm_studio",
         "export_directory": "",
         "font_size": 12,
         "diarization_enabled": False,
         "last_import_dir": "",
         "hf_token": "",
+        "soap_layout": "grid",
     }
 
 
@@ -190,3 +191,11 @@ class ConfigManager:
     @hf_token.setter
     def hf_token(self, value: str) -> None:
         self.set("hf_token", value)
+
+    @property
+    def soap_layout(self) -> str:
+        return self._config.get("soap_layout", "grid")
+
+    @soap_layout.setter
+    def soap_layout(self, value: str) -> None:
+        self.set("soap_layout", value)
