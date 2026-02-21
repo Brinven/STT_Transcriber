@@ -37,8 +37,10 @@
 - **Model:** `google/medasr` on HuggingFace (requires accepting Health AI Developer Foundations terms)
 - **Architecture:** Conformer (CTC-based), 105M parameters
 - **Input:** 16 kHz mono int16 audio
-- **Inference:** `AutoModelForCTC` + `AutoProcessor` from transformers, or `pipeline("automatic-speech-recognition")`
-- **Chunking:** Use `chunk_length_s=20, stride_length_s=2` for long audio
+- **Inference:** `AutoModelForCTC` + `AutoProcessor` with manual CTC greedy decoding. Do NOT use `pipeline("automatic-speech-recognition")` — its CTC decoder is broken for this model and produces stuttered/duplicated output.
+- **CTC Decoding:** argmax → collapse consecutive duplicate token IDs → remove blank (epsilon=0) → tokenizer.decode. Implemented in `MedASREngine._ctc_decode()`.
+- **LasrFeatureExtractor bug:** transformers has a bug where `__call__` passes 3 args to `_torch_extract_fbank_features` but the method only accepts 2. Patched at load time in `MedASREngine._patch_lasr_feature_extractor()`.
+- **Chunking:** FileTranscribeWorker segments audio into 30s chunks for transcription
 - **Performance:** 4.6% WER on radiology dictation, 5.8% on family medicine (with 6-gram LM)
 - **Limitation:** English only, best on high-quality mic audio, may lack very recent medical terms
 - **GPU:** Supports CUDA if available, falls back to CPU
@@ -52,23 +54,27 @@ STT_Transcriber/
 ├── Stt_Transcriber20.2_plan.md   # PRD (reference only)
 ├── requirements.txt
 ├── main.py                        # Entry point
+├── run.bat                        # One-click venv setup + launch
 ├── backend/
 │   ├── __init__.py
 │   ├── audio_capture.py           # Mic and WASAPI loopback recording
-│   ├── stt_engine.py              # STT engine abstraction (faster-whisper + MedASR)
-│   ├── medical_formatter.py       # Ollama/LM Studio SOAP formatting
+│   ├── stt_engine.py              # STT engine: faster-whisper + MedASR (manual CTC)
+│   ├── diarization.py             # Speaker diarization via pyannote.audio
+│   ├── medical_formatter.py       # LM Studio/Ollama SOAP formatting
 │   ├── file_manager.py            # Export to TXT, CSV, MD
 │   ├── config_manager.py          # JSON config read/write
+│   ├── errors.py                  # Custom exception classes
 │   └── paths.py                   # Centralized path resolution
 ├── gui/
 │   ├── __init__.py
 │   ├── app.py                     # MainWindow (QMainWindow)
 │   ├── widgets/
 │   │   ├── __init__.py
+│   │   ├── audio_player.py        # Embedded audio player for imported files
 │   │   ├── audio_controls.py      # Record/Stop/Pause buttons, source selector
 │   │   ├── transcript_view.py     # Scrollable transcript display
-│   │   └── soap_view.py           # SOAP notes display (medical mode)
-│   └── workers.py                 # QThread workers for audio, STT, LLM
+│   │   └── soap_view.py           # SOAP notes display (grid/vertical, medical mode)
+│   └── workers.py                 # QThread workers for audio, STT, diarization, LLM
 ├── resources/
 │   └── icons/                     # UI icons (if any)
 ├── tests/
@@ -126,11 +132,15 @@ Medical mode has two stages:
   "audio_device_index": null,
   "whisper_model_size": "base",
   "medasr_device": "auto",
-  "llm_endpoint": "http://localhost:11434/api/generate",
-  "llm_model": "medllama2",
-  "llm_provider": "ollama",
+  "llm_endpoint": "http://localhost:1234/v1/chat/completions",
+  "llm_model": "medgemma-1.5-4b-it",
+  "llm_provider": "lm_studio",
   "export_directory": "",
-  "font_size": 12
+  "font_size": 12,
+  "diarization_enabled": false,
+  "last_import_dir": "",
+  "hf_token": "",
+  "soap_layout": "grid"
 }
 ```
 
