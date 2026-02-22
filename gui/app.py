@@ -46,7 +46,9 @@ from backend.file_manager import (
 from backend.diarization import SPEAKER_COLORS, SpeakerSegment
 from backend.paths import ensure_data_dirs
 from backend.stt_engine import MedASREngine, STTEngine
+from backend.vision_engine import VISION_PRESETS
 from gui.widgets.audio_player import AudioPlayerWidget
+from gui.widgets.image_analysis_view import ImageAnalysisView
 from gui.widgets.soap_view import SoapView
 from gui.workers import (
     AudioWorker,
@@ -57,6 +59,8 @@ from gui.workers import (
     ModelLoadWorker,
     SoapFormatWorker,
     TranscribeWorker,
+    VisionAnalysisWorker,
+    VisionModelLoadWorker,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +98,12 @@ class MainWindow(QMainWindow):
         self._medasr_load_worker: Optional[MedASRModelLoadWorker] = None
         self._soap_worker: Optional[SoapFormatWorker] = None
 
+        # -- Vision state --
+        self._vision_engine: object | None = None
+        self._vision_load_worker: Optional[VisionModelLoadWorker] = None
+        self._vision_analysis_worker: Optional[VisionAnalysisWorker] = None
+        self._pending_vision_analysis: tuple[str, str] | None = None
+
         # -- Diarization state --
         self._diarize_engine: object | None = None
         self._diarize_model_load_worker: Optional[DiarizeModelLoadWorker] = None
@@ -114,6 +124,10 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self._on_export_clicked)
         self.export_action.triggered.connect(self._on_export_clicked)
         self.btn_soapify.clicked.connect(self._on_soapify_clicked)
+        self.btn_upload_image.clicked.connect(self._on_upload_image_clicked)
+        self.image_analysis_view.analyze_requested.connect(
+            self._on_analyze_image
+        )
         self.btn_clear.clicked.connect(self._on_clear_all_clicked)
 
         # Enable Record and Import WAV buttons
@@ -173,6 +187,9 @@ class MainWindow(QMainWindow):
 
         soap_layout_action = settings_menu.addAction("SOAP &Layout...")
         soap_layout_action.triggered.connect(self._on_soap_layout_settings)
+
+        vision_device_action = settings_menu.addAction("&Vision Device...")
+        vision_device_action.triggered.connect(self._on_vision_device_settings)
 
     # ------------------------------------------------------------------
     # Central widget
@@ -285,12 +302,22 @@ class MainWindow(QMainWindow):
         self.soap_view.setVisible(False)
         layout.addWidget(self.soap_view)
 
+        # -- Image analysis view (hidden by default, shown on Upload Image) --
+        self.image_analysis_view = ImageAnalysisView()
+        self.image_analysis_view.populate_presets(VISION_PRESETS)
+        self.image_analysis_view.setVisible(False)
+        layout.addWidget(self.image_analysis_view)
+
         # -- Bottom bar --
         bottom_bar = QHBoxLayout()
 
         self.btn_soapify = QPushButton("SOAPify")
         self.btn_soapify.setEnabled(False)
         self.btn_soapify.setVisible(False)
+
+        self.btn_upload_image = QPushButton("Upload Image")
+        self.btn_upload_image.setEnabled(True)
+        self.btn_upload_image.setVisible(False)
 
         self.btn_clear = QPushButton("Clear All")
         self.btn_clear.setEnabled(False)
@@ -299,6 +326,7 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
 
         bottom_bar.addWidget(self.btn_soapify)
+        bottom_bar.addWidget(self.btn_upload_image)
         bottom_bar.addStretch()
         bottom_bar.addWidget(self.btn_clear)
         bottom_bar.addWidget(self.btn_export)
@@ -324,16 +352,21 @@ class MainWindow(QMainWindow):
         self.btn_general.setChecked(not is_medical)
         self.btn_medical.setChecked(is_medical)
         self.btn_soapify.setVisible(is_medical)
+        self.btn_upload_image.setVisible(is_medical)
 
         # Enable SOAPify only if medical mode and we have segments
         if is_medical:
             self.btn_soapify.setEnabled(bool(self._segments))
         else:
-            # Switching away from medical — hide SOAP view, unload MedASR
+            # Switching away from medical — hide views, unload models
             self.soap_view.setVisible(False)
+            self.image_analysis_view.setVisible(False)
             if self._medasr_engine is not None:
                 self._medasr_engine.unload_model()
                 self._medasr_engine = None
+            if self._vision_engine is not None:
+                self._vision_engine.unload_model()  # type: ignore[union-attr]
+                self._vision_engine = None
 
         mode_text = "Medical" if is_medical else "General"
         self.mode_status.setText(f"Mode: {mode_text}")
@@ -813,6 +846,8 @@ class MainWindow(QMainWindow):
         self.audio_player.clear()
         self.soap_view.clear()
         self.soap_view.setVisible(False)
+        self.image_analysis_view.clear()
+        self.image_analysis_view.setVisible(False)
         self.btn_export.setEnabled(False)
         self.btn_clear.setEnabled(False)
         self.btn_soapify.setEnabled(False)
@@ -871,6 +906,171 @@ class MainWindow(QMainWindow):
             self._soap_worker.deleteLater()
             self._soap_worker = None
         self.btn_soapify.setEnabled(bool(self._segments))
+
+    # ------------------------------------------------------------------
+    # Vision: image upload + analysis
+    # ------------------------------------------------------------------
+
+    def _on_upload_image_clicked(self) -> None:
+        """Open file dialog for medical image upload."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload Medical Image",
+            self.config.last_import_dir,
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        self.config.last_import_dir = str(Path(file_path).parent)
+
+        if self.image_analysis_view.load_image(file_path):
+            self.image_analysis_view.setVisible(True)
+
+    def _on_analyze_image(self, image_path: str, query: str) -> None:
+        """Handle analyze_requested signal from ImageAnalysisView."""
+        if self._vision_analysis_worker is not None:
+            return  # Already running
+
+        if not self._ensure_vision_loaded(image_path, query):
+            return  # Will continue after model loads
+
+        self._run_vision_analysis(image_path, query)
+
+    def _ensure_vision_loaded(self, image_path: str, query: str) -> bool:
+        """Start vision model loading if needed. Returns True if already loaded."""
+        if self._vision_engine is not None and self._vision_engine.is_loaded:  # type: ignore[union-attr]
+            return True
+
+        if self._vision_load_worker is not None:
+            return False  # Already loading
+
+        # Save pending analysis to run after model loads
+        self._pending_vision_analysis = (image_path, query)
+        self.image_analysis_view.set_busy(True)
+
+        self._vision_load_worker = VisionModelLoadWorker(
+            device=self.config.vision_device,
+            hf_token=self.config.hf_token,
+            parent=self,
+        )
+        self._vision_load_worker.progress.connect(self._on_model_progress)
+        self._vision_load_worker.finished.connect(self._on_vision_loaded)
+        self._vision_load_worker.error.connect(self._on_vision_load_error)
+        self._vision_load_worker.finished.connect(
+            self._vision_load_worker.deleteLater
+        )
+        self._vision_load_worker.error.connect(
+            self._vision_load_worker.deleteLater
+        )
+        self._vision_load_worker.start()
+        return False
+
+    def _on_vision_loaded(self, engine: object) -> None:
+        """Vision model loaded — save engine and run pending analysis."""
+        self._vision_engine = engine
+        self._vision_load_worker = None
+        self.status_label.setText("Ready")
+        logger.info("MedGemma vision engine loaded and ready")
+
+        # Run the pending analysis if any
+        pending = self._pending_vision_analysis
+        self._pending_vision_analysis = None
+        if pending:
+            self._run_vision_analysis(*pending)
+        else:
+            self.image_analysis_view.set_busy(False)
+
+    def _on_vision_load_error(self, message: str) -> None:
+        """Vision model load failed."""
+        self._vision_load_worker = None
+        self._pending_vision_analysis = None
+        self.image_analysis_view.set_busy(False)
+        self.status_label.setText("Ready")
+
+        hint = ""
+        if "401" in message or "access" in message.lower():
+            hint = (
+                "\n\nYou may need to accept the model terms at:\n"
+                "https://huggingface.co/google/medgemma-1.5-4b-it\n\n"
+                "Set your HuggingFace token in Settings > HuggingFace Token."
+            )
+        QMessageBox.critical(
+            self,
+            "Vision Model Load Error",
+            f"Failed to load MedGemma vision model:\n\n{message}{hint}",
+        )
+
+    def _run_vision_analysis(self, image_path: str, query: str) -> None:
+        """Create and start the VisionAnalysisWorker."""
+        self.image_analysis_view.set_busy(True)
+        self.status_label.setText("Analyzing image...")
+
+        self._vision_analysis_worker = VisionAnalysisWorker(
+            engine=self._vision_engine,
+            image_path=image_path,
+            query=query,
+            parent=self,
+        )
+        self._vision_analysis_worker.analysis_ready.connect(
+            self._on_analysis_ready
+        )
+        self._vision_analysis_worker.error.connect(self._on_analysis_error)
+        self._vision_analysis_worker.progress.connect(self._on_model_progress)
+        self._vision_analysis_worker.finished.connect(
+            self._on_vision_analysis_finished
+        )
+        self._vision_analysis_worker.start()
+
+    def _on_analysis_ready(self, text: str) -> None:
+        """Handle successful image analysis."""
+        self.image_analysis_view.set_results(text)
+        self.status_label.setText("Analysis complete")
+        self.statusBar().showMessage("Image analysis complete", 3000)
+        logger.info("Image analysis completed successfully")
+
+    def _on_analysis_error(self, message: str) -> None:
+        """Handle image analysis failure."""
+        self.status_label.setText("Ready")
+        QMessageBox.critical(
+            self,
+            "Image Analysis Error",
+            f"Failed to analyze image:\n\n{message}",
+        )
+
+    def _on_vision_analysis_finished(self) -> None:
+        """Clean up vision analysis worker."""
+        if self._vision_analysis_worker is not None:
+            self._vision_analysis_worker.deleteLater()
+            self._vision_analysis_worker = None
+        self.image_analysis_view.set_busy(False)
+        self.status_label.setText("Ready")
+
+    # ------------------------------------------------------------------
+    # Vision device settings
+    # ------------------------------------------------------------------
+
+    def _on_vision_device_settings(self) -> None:
+        """Let user pick the device for MedGemma vision model."""
+        options = ["auto", "cuda", "cpu"]
+        current = self.config.vision_device
+        current_idx = options.index(current) if current in options else 0
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Vision Device",
+            "Select device for MedGemma vision model:",
+            options,
+            current_idx,
+            False,
+        )
+        if ok and choice != current:
+            self.config.vision_device = choice
+            # Unload vision engine so it reloads on new device
+            if self._vision_engine is not None:
+                self._vision_engine.unload_model()  # type: ignore[union-attr]
+                self._vision_engine = None
+            self.statusBar().showMessage(f"Vision device set to: {choice}", 3000)
 
     # ------------------------------------------------------------------
     # Diarization

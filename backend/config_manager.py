@@ -34,6 +34,7 @@ def _get_defaults() -> dict[str, Any]:
         "last_import_dir": "",
         "hf_token": "",
         "soap_layout": "grid",
+        "vision_device": "auto",
     }
 
 
@@ -199,3 +200,11 @@ class ConfigManager:
     @soap_layout.setter
     def soap_layout(self, value: str) -> None:
         self.set("soap_layout", value)
+
+    @property
+    def vision_device(self) -> str:
+        return self._config.get("vision_device", "auto")
+
+    @vision_device.setter
+    def vision_device(self, value: str) -> None:
+        self.set("vision_device", value)

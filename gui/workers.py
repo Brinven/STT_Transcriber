@@ -14,7 +14,13 @@ import soundfile as sf
 from PySide6.QtCore import QThread, Signal
 
 from backend.audio_capture import AudioCapture, resample, TARGET_SR
-from backend.errors import AudioCaptureError, DiarizationError, LLMConnectionError, STTEngineError
+from backend.errors import (
+    AudioCaptureError,
+    DiarizationError,
+    LLMConnectionError,
+    STTEngineError,
+    VisionEngineError,
+)
 from backend.medical_formatter import format_soap
 from backend.stt_engine import MedASREngine, STTEngine
 
@@ -379,6 +385,88 @@ class DiarizeWorker(QThread):
         except Exception as exc:
             logger.exception("Unexpected diarization error")
             self.error.emit(f"Diarization error: {exc}")
+
+
+class VisionModelLoadWorker(QThread):
+    """Loads the MedGemma vision model on a background thread.
+
+    Signals:
+        finished: Emitted with the loaded MedGemmaVisionEngine on success.
+        error: Emitted with an error message string on failure.
+        progress: Emitted with status text during loading.
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        device: str = "auto",
+        hf_token: str = "",
+        parent: Optional[object] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._device = device
+        self._hf_token = hf_token
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Loading MedGemma vision model (first run may download ~8 GB)..."
+            )
+            from backend.vision_engine import MedGemmaVisionEngine
+
+            engine = MedGemmaVisionEngine(self._device, hf_token=self._hf_token)
+            engine.load_model()
+            self.finished.emit(engine)
+        except VisionEngineError as exc:
+            logger.exception("Vision model loading failed")
+            self.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Unexpected error loading vision model")
+            self.error.emit(f"Unexpected error: {exc}")
+
+
+class VisionAnalysisWorker(QThread):
+    """Runs medical image analysis on a background thread.
+
+    Signals:
+        analysis_ready: Emitted with the analysis text on success.
+        error: Emitted with an error message string on failure.
+        progress: Emitted with status text during processing.
+    """
+
+    analysis_ready = Signal(str)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        engine: object,
+        image_path: str,
+        query: str,
+        parent: Optional[object] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._image_path = image_path
+        self._query = query
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("Analyzing image...")
+            from PIL import Image
+
+            image = Image.open(self._image_path).convert("RGB")
+            result = self._engine.analyze(image, self._query)  # type: ignore[union-attr]
+            self.analysis_ready.emit(result)
+        except VisionEngineError as exc:
+            logger.exception("Image analysis failed")
+            self.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Unexpected error during image analysis")
+            self.error.emit(f"Image analysis error: {exc}")
 
 
 class SoapFormatWorker(QThread):

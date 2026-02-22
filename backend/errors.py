@@ -19,3 +19,7 @@ class LLMConnectionError(RuntimeError):
 
 class DiarizationError(RuntimeError):
     """Raised when speaker diarization fails during loading or inference."""
+
+
+class VisionEngineError(RuntimeError):
+    """Raised when medical image analysis fails during loading or inference."""
