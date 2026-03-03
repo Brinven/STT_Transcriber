@@ -387,86 +387,121 @@ class DiarizeWorker(QThread):
             self.error.emit(f"Diarization error: {exc}")
 
 
-class VisionModelLoadWorker(QThread):
-    """Loads the MedGemma vision model on a background thread.
-
-    Signals:
-        finished: Emitted with the loaded MedGemmaVisionEngine on success.
-        error: Emitted with an error message string on failure.
-        progress: Emitted with status text during loading.
-    """
-
-    finished = Signal(object)
-    error = Signal(str)
-    progress = Signal(str)
-
-    def __init__(
-        self,
-        device: str = "auto",
-        hf_token: str = "",
-        parent: Optional[object] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._device = device
-        self._hf_token = hf_token
-
-    def run(self) -> None:
-        try:
-            self.progress.emit(
-                "Loading MedGemma vision model (first run may download ~8 GB)..."
-            )
-            from backend.vision_engine import MedGemmaVisionEngine
-
-            engine = MedGemmaVisionEngine(self._device, hf_token=self._hf_token)
-            engine.load_model()
-            self.finished.emit(engine)
-        except VisionEngineError as exc:
-            logger.exception("Vision model loading failed")
-            self.error.emit(str(exc))
-        except Exception as exc:
-            logger.exception("Unexpected error loading vision model")
-            self.error.emit(f"Unexpected error: {exc}")
-
-
 class VisionAnalysisWorker(QThread):
-    """Runs medical image analysis on a background thread.
+    """Analyzes one or more medical images sequentially.
+
+    Each image is sent individually to the LLM so every slice gets
+    the model's full attention.  Partial results are emitted after
+    each image completes.
 
     Signals:
-        analysis_ready: Emitted with the analysis text on success.
+        image_result: ``(filename, text)`` after each image finishes.
+        analysis_ready: Emitted with the full combined text on success.
         error: Emitted with an error message string on failure.
         progress: Emitted with status text during processing.
     """
 
+    image_result = Signal(str, str)
     analysis_ready = Signal(str)
     error = Signal(str)
     progress = Signal(str)
 
     def __init__(
         self,
-        engine: object,
-        image_path: str,
+        image_paths: list[str],
         query: str,
+        endpoint: str,
+        model: str,
+        provider: str,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
-        self._engine = engine
-        self._image_path = image_path
+        self._image_paths = image_paths
         self._query = query
+        self._endpoint = endpoint
+        self._model = model
+        self._provider = provider
 
     def run(self) -> None:
-        try:
-            self.progress.emit("Analyzing image...")
-            from PIL import Image
+        from pathlib import Path as _Path
 
-            image = Image.open(self._image_path).convert("RGB")
-            result = self._engine.analyze(image, self._query)  # type: ignore[union-attr]
-            self.analysis_ready.emit(result)
-        except VisionEngineError as exc:
-            logger.exception("Image analysis failed")
-            self.error.emit(str(exc))
-        except Exception as exc:
-            logger.exception("Unexpected error during image analysis")
-            self.error.emit(f"Image analysis error: {exc}")
+        from backend.vision_engine import analyze_image, synthesize_series
+
+        total = len(self._image_paths)
+        per_image: list[tuple[str, str]] = []   # (filename, text)
+        sections: list[str] = []
+
+        # --- Pass 1: per-image analysis ---
+        for idx, img_path in enumerate(self._image_paths, 1):
+            if self.isInterruptionRequested():
+                return
+
+            filename = _Path(img_path).name
+            self.progress.emit(f"Analyzing image {idx} of {total} ({filename})...")
+
+            try:
+                query = self._query
+                if total > 1:
+                    query = (
+                        f"This is image {idx} of {total} in a series "
+                        f"(filename: {filename}). {query}"
+                    )
+
+                text = analyze_image(
+                    img_path,
+                    query,
+                    self._endpoint,
+                    self._model,
+                    self._provider,
+                )
+
+                per_image.append((filename, text))
+                sections.append(f"--- {filename} ({idx}/{total}) ---\n{text}")
+                self.image_result.emit(filename, text)
+
+            except (VisionEngineError, Exception) as exc:
+                logger.exception("Analysis failed for %s", filename)
+                err_text = f"[Error: {exc}]"
+                per_image.append((filename, err_text))
+                sections.append(f"--- {filename} ({idx}/{total}) ---\n{err_text}")
+                self.image_result.emit(filename, err_text)
+
+        # --- Pass 2: synthesis across all images (multi-image only) ---
+        synthesis_section = ""
+        if total > 1 and not self.isInterruptionRequested():
+            self.progress.emit("Synthesizing combined analysis...")
+            try:
+                synthesis = synthesize_series(
+                    per_image,
+                    self._query,
+                    self._endpoint,
+                    self._model,
+                    self._provider,
+                )
+                synthesis_section = (
+                    f"{'=' * 50}\n"
+                    f"COMBINED SERIES ANALYSIS\n"
+                    f"{'=' * 50}\n"
+                    f"{synthesis}"
+                )
+                self.image_result.emit("Combined Analysis", synthesis)
+            except (VisionEngineError, Exception) as exc:
+                logger.exception("Series synthesis failed")
+                synthesis_section = f"[Synthesis error: {exc}]"
+
+        # Put combined analysis first, individual slices after
+        ordered: list[str] = []
+        if synthesis_section:
+            ordered.append(synthesis_section)
+            ordered.append(
+                f"{'=' * 50}\n"
+                f"INDIVIDUAL SLICE DETAILS\n"
+                f"{'=' * 50}"
+            )
+        ordered.extend(sections)
+
+        combined = "\n\n".join(ordered)
+        self.analysis_ready.emit(combined)
 
 
 class SoapFormatWorker(QThread):

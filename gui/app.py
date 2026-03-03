@@ -60,7 +60,6 @@ from gui.workers import (
     SoapFormatWorker,
     TranscribeWorker,
     VisionAnalysisWorker,
-    VisionModelLoadWorker,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,10 +98,7 @@ class MainWindow(QMainWindow):
         self._soap_worker: Optional[SoapFormatWorker] = None
 
         # -- Vision state --
-        self._vision_engine: object | None = None
-        self._vision_load_worker: Optional[VisionModelLoadWorker] = None
         self._vision_analysis_worker: Optional[VisionAnalysisWorker] = None
-        self._pending_vision_analysis: tuple[str, str] | None = None
 
         # -- Diarization state --
         self._diarize_engine: object | None = None
@@ -188,8 +184,6 @@ class MainWindow(QMainWindow):
         soap_layout_action = settings_menu.addAction("SOAP &Layout...")
         soap_layout_action.triggered.connect(self._on_soap_layout_settings)
 
-        vision_device_action = settings_menu.addAction("&Vision Device...")
-        vision_device_action.triggered.connect(self._on_vision_device_settings)
 
     # ------------------------------------------------------------------
     # Central widget
@@ -364,9 +358,6 @@ class MainWindow(QMainWindow):
             if self._medasr_engine is not None:
                 self._medasr_engine.unload_model()
                 self._medasr_engine = None
-            if self._vision_engine is not None:
-                self._vision_engine.unload_model()  # type: ignore[union-attr]
-                self._vision_engine = None
 
         mode_text = "Medical" if is_medical else "General"
         self.mode_status.setText(f"Mode: {mode_text}")
@@ -912,105 +903,49 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_upload_image_clicked(self) -> None:
-        """Open file dialog for medical image upload."""
-        file_path, _ = QFileDialog.getOpenFileName(
+        """Open file dialog for medical image upload (supports multi-select)."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Upload Medical Image",
+            "Upload Medical Images (up to 4)",
             self.config.last_import_dir,
             "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp);;All Files (*)",
         )
-        if not file_path:
+        if not file_paths:
             return
 
-        self.config.last_import_dir = str(Path(file_path).parent)
+        self.config.last_import_dir = str(Path(file_paths[0]).parent)
 
-        if self.image_analysis_view.load_image(file_path):
-            self.image_analysis_view.setVisible(True)
+        for fp in file_paths:
+            if self.image_analysis_view.load_image(fp):
+                self.image_analysis_view.setVisible(True)
 
-    def _on_analyze_image(self, image_path: str, query: str) -> None:
+    def _on_analyze_image(self, image_paths_joined: str, query: str) -> None:
         """Handle analyze_requested signal from ImageAnalysisView."""
         if self._vision_analysis_worker is not None:
             return  # Already running
 
-        if not self._ensure_vision_loaded(image_path, query):
-            return  # Will continue after model loads
+        image_paths = image_paths_joined.split("|")
+        self._run_vision_analysis(image_paths, query)
 
-        self._run_vision_analysis(image_path, query)
-
-    def _ensure_vision_loaded(self, image_path: str, query: str) -> bool:
-        """Start vision model loading if needed. Returns True if already loaded."""
-        if self._vision_engine is not None and self._vision_engine.is_loaded:  # type: ignore[union-attr]
-            return True
-
-        if self._vision_load_worker is not None:
-            return False  # Already loading
-
-        # Save pending analysis to run after model loads
-        self._pending_vision_analysis = (image_path, query)
-        self.image_analysis_view.set_busy(True)
-
-        self._vision_load_worker = VisionModelLoadWorker(
-            device=self.config.vision_device,
-            hf_token=self.config.hf_token,
-            parent=self,
-        )
-        self._vision_load_worker.progress.connect(self._on_model_progress)
-        self._vision_load_worker.finished.connect(self._on_vision_loaded)
-        self._vision_load_worker.error.connect(self._on_vision_load_error)
-        self._vision_load_worker.finished.connect(
-            self._vision_load_worker.deleteLater
-        )
-        self._vision_load_worker.error.connect(
-            self._vision_load_worker.deleteLater
-        )
-        self._vision_load_worker.start()
-        return False
-
-    def _on_vision_loaded(self, engine: object) -> None:
-        """Vision model loaded — save engine and run pending analysis."""
-        self._vision_engine = engine
-        self._vision_load_worker = None
-        self.status_label.setText("Ready")
-        logger.info("MedGemma vision engine loaded and ready")
-
-        # Run the pending analysis if any
-        pending = self._pending_vision_analysis
-        self._pending_vision_analysis = None
-        if pending:
-            self._run_vision_analysis(*pending)
-        else:
-            self.image_analysis_view.set_busy(False)
-
-    def _on_vision_load_error(self, message: str) -> None:
-        """Vision model load failed."""
-        self._vision_load_worker = None
-        self._pending_vision_analysis = None
-        self.image_analysis_view.set_busy(False)
-        self.status_label.setText("Ready")
-
-        hint = ""
-        if "401" in message or "access" in message.lower():
-            hint = (
-                "\n\nYou may need to accept the model terms at:\n"
-                "https://huggingface.co/google/medgemma-1.5-4b-it\n\n"
-                "Set your HuggingFace token in Settings > HuggingFace Token."
-            )
-        QMessageBox.critical(
-            self,
-            "Vision Model Load Error",
-            f"Failed to load MedGemma vision model:\n\n{message}{hint}",
-        )
-
-    def _run_vision_analysis(self, image_path: str, query: str) -> None:
+    def _run_vision_analysis(self, image_paths: list[str], query: str) -> None:
         """Create and start the VisionAnalysisWorker."""
         self.image_analysis_view.set_busy(True)
-        self.status_label.setText("Analyzing image...")
+        # Clear previous results so incremental results start fresh
+        self.image_analysis_view.results_edit.clear()
+        n = len(image_paths)
+        label = "image" if n == 1 else f"{n} images"
+        self.status_label.setText(f"Analyzing {label}...")
 
         self._vision_analysis_worker = VisionAnalysisWorker(
-            engine=self._vision_engine,
-            image_path=image_path,
+            image_paths=image_paths,
             query=query,
+            endpoint=self.config.llm_endpoint,
+            model=self.config.llm_model,
+            provider=self.config.llm_provider,
             parent=self,
+        )
+        self._vision_analysis_worker.image_result.connect(
+            self._on_image_result
         )
         self._vision_analysis_worker.analysis_ready.connect(
             self._on_analysis_ready
@@ -1022,9 +957,23 @@ class MainWindow(QMainWindow):
         )
         self._vision_analysis_worker.start()
 
+    def _on_image_result(self, filename: str, text: str) -> None:
+        """Append a per-image result to the results panel incrementally."""
+        safe_name = html.escape(filename, quote=False)
+        safe_text = html.escape(text, quote=False).replace("\n", "<br>")
+        separator = "<hr>" if self.image_analysis_view.results_edit.toPlainText() else ""
+        self.image_analysis_view.results_edit.append(
+            f'{separator}<b>--- {safe_name} ---</b><br>{safe_text}'
+        )
+        # Auto-scroll
+        sb = self.image_analysis_view.results_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _on_analysis_ready(self, text: str) -> None:
-        """Handle successful image analysis."""
+        """Handle completed image analysis (all images done)."""
+        # Final combined text replaces incremental HTML with clean version
         self.image_analysis_view.set_results(text)
+        self.btn_clear.setEnabled(True)
         self.status_label.setText("Analysis complete")
         self.statusBar().showMessage("Image analysis complete", 3000)
         logger.info("Image analysis completed successfully")
@@ -1045,32 +994,6 @@ class MainWindow(QMainWindow):
             self._vision_analysis_worker = None
         self.image_analysis_view.set_busy(False)
         self.status_label.setText("Ready")
-
-    # ------------------------------------------------------------------
-    # Vision device settings
-    # ------------------------------------------------------------------
-
-    def _on_vision_device_settings(self) -> None:
-        """Let user pick the device for MedGemma vision model."""
-        options = ["auto", "cuda", "cpu"]
-        current = self.config.vision_device
-        current_idx = options.index(current) if current in options else 0
-
-        choice, ok = QInputDialog.getItem(
-            self,
-            "Vision Device",
-            "Select device for MedGemma vision model:",
-            options,
-            current_idx,
-            False,
-        )
-        if ok and choice != current:
-            self.config.vision_device = choice
-            # Unload vision engine so it reloads on new device
-            if self._vision_engine is not None:
-                self._vision_engine.unload_model()  # type: ignore[union-attr]
-                self._vision_engine = None
-            self.statusBar().showMessage(f"Vision device set to: {choice}", 3000)
 
     # ------------------------------------------------------------------
     # Diarization

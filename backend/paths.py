@@ -25,6 +25,7 @@ DATA_DIR = os.path.join(APP_ROOT, "data")
 CONFIG_DIR = os.path.join(DATA_DIR, "config")
 LOGS_DIR = os.path.join(DATA_DIR, "logs")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
+PDF_DIR = os.path.join(DATA_DIR, "Generated PDF")
 
 
 def ensure_data_dirs() -> None:
@@ -32,3 +33,4 @@ def ensure_data_dirs() -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(LOGS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(PDF_DIR, exist_ok=True)
